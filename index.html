@@ -6950,18 +6950,184 @@ function action(type){if(type==='play'){window.gnxV11SelectedGame=selected;local
   #gnxVoiceRoomOverlay.show .gnx-vr-send{background:linear-gradient(135deg,#7c3aed,#a855f7)!important;font-size:20px!important}
 }
 </style>
-<script id="gamenex-mic-guard-v1">
+
+<script id="gamenex-voice-webrtc-v1">
 (function(){
-  const old=window.toggleVoiceConnection;
-  if(typeof old!=='function') return;
-  window.toggleVoiceConnection=async function(){
-    if(!window.isSecureContext && location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
-      const ok=confirm('🎙️ O GameNex precisa estar em HTTPS para liberar o microfone no celular.\n\nEste arquivo está sendo aberto diretamente no aparelho.\n\nVamos preparar o GameNex para funcionar em um endereço HTTPS gratuito na próxima etapa.');
-      if(ok && typeof toast==='function') toast('🌐 Abra o GameNex por um endereço HTTPS para liberar o microfone.');
+  'use strict';
+  const REALTIME_URL='wss://ouagazawjrzxijoenoyq.supabase.co/realtime/v1/websocket';
+  const REALTIME_KEY='sb_publishable_NWnUiRkwhBb568TiWHTx-w_ZBEb63_3';
+  const STUN=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];
+  const clientId=(globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():('gnx-'+Date.now()+'-'+Math.random().toString(36).slice(2));
+  let ws=null, wsRef=0, wsTopic='', wsReady=false, wsTimer=null, reconnectTimer=null;
+  let rtcPeers=new Map(), pendingIce=new Map(), remoteAudios=new Map(), joiningRoomId='';
+  let destroyed=false;
+
+  function log(){try{console.debug('[GameNex Voice]',...arguments)}catch(e){}}
+  function roomTopic(id){return 'realtime:voice:'+String(id||'').replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,90)}
+  function sendWs(event,payload,ref){
+    if(!ws||ws.readyState!==1||!wsTopic)return false;
+    try{ws.send(JSON.stringify({topic:wsTopic,event,payload:payload||{},ref:String(ref||(++wsRef))}));return true}catch(e){return false}
+  }
+  function clearReconnect(){if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}}
+  function scheduleReconnect(){
+    if(destroyed||!joiningRoomId||!voiceConnected)return;
+    clearReconnect(); reconnectTimer=setTimeout(function(){if(!destroyed&&joiningRoomId&&voiceConnected)connectRealtime().catch(()=>{})},1800);
+  }
+  function stopHeartbeat(){if(wsTimer){clearInterval(wsTimer);wsTimer=null}}
+  function startHeartbeat(){stopHeartbeat();wsTimer=setInterval(function(){if(ws&&ws.readyState===1){try{ws.send(JSON.stringify({topic:'phoenix',event:'heartbeat',payload:{},ref:String(++wsRef)}))}catch(e){}}},25000)}
+
+  function ensureAudioBox(){
+    let box=document.getElementById('gnxRemoteVoiceAudio');
+    if(box)return box;
+    box=document.createElement('div');box.id='gnxRemoteVoiceAudio';box.setAttribute('aria-hidden','true');
+    box.style.cssText='position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden;pointer-events:none;opacity:0;';
+    document.body.appendChild(box);return box;
+  }
+  function removeRemoteAudio(id){
+    const a=remoteAudios.get(id);if(a){try{a.pause()}catch(e){};try{a.srcObject=null}catch(e){};a.remove();remoteAudios.delete(id)}
+  }
+  function addRemoteAudio(id,stream){
+    const box=ensureAudioBox();let a=remoteAudios.get(id);
+    if(!a){a=document.createElement('audio');a.id='gnx-remote-audio-'+id;a.autoplay=true;a.playsInline=true;a.controls=false;a.muted=false;a.volume=1;a.style.display='none';box.appendChild(a);remoteAudios.set(id,a)}
+    a.srcObject=stream;
+    const p=a.play();if(p&&p.catch)p.catch(()=>{try{document.addEventListener('click',function(){a.play().catch(()=>{})},{once:true,passive:true})}catch(e){}});
+  }
+
+  function sendVoiceSignal(type,payload){
+    return sendWs('broadcast',{type:'broadcast',event:'gnx-voice',payload:Object.assign({type,from:clientId,name:(typeof myName==='function'?myName():'Jogador'),roomId:joiningRoomId},payload||{})});
+  }
+
+  function makePeer(id,name,initiator){
+    if(!joiningRoomId)return null;
+    if(rtcPeers.has(id))return rtcPeers.get(id).pc;
+    const pc=new RTCPeerConnection({iceServers:STUN});
+    const item={pc,id,name:name||'Jogador',remoteSet:false};rtcPeers.set(id,item);pendingIce.set(id,[]);
+    if(roomMicStream) roomMicStream.getTracks().forEach(t=>{try{pc.addTrack(t,roomMicStream)}catch(e){}});
+    pc.onicecandidate=e=>{if(e.candidate)sendVoiceSignal('ice',{to:id,candidate:e.candidate})};
+    pc.ontrack=e=>{const stream=e.streams&&e.streams[0];if(stream)addRemoteAudio(id,stream);};
+    pc.onconnectionstatechange=()=>{
+      const st=pc.connectionState;
+      if(st==='connected'){voiceConnections[joiningRoomId]=true;try{if(typeof renderRoom==='function')renderRoom()}catch(e){}}
+      if(st==='failed'||st==='closed'||st==='disconnected'){
+        if(st==='failed'){try{pc.restartIce()}catch(e){}}
+        if(st==='closed'){rtcPeers.delete(id);pendingIce.delete(id);removeRemoteAudio(id)}
+      }
+    };
+    if(initiator){
+      pc.createOffer({offerToReceiveAudio:true}).then(o=>pc.setLocalDescription(o)).then(()=>sendVoiceSignal('offer',{to:id,sdp:pc.localDescription})).catch(e=>log('offer',e));
+    }
+    return pc;
+  }
+
+  async function handleSignal(p){
+    if(!p||p.from===clientId||p.roomId!==joiningRoomId)return;
+    if(p.to&&p.to!==clientId)return;
+    if(p.type==='join'){
+      // Quem já está na sala responde ao novo participante com uma oferta.
+      if(voiceConnected){makePeer(p.from,p.name,true)}
       return;
     }
-    return old.apply(this,arguments);
+    if(p.type==='leave'){
+      const item=rtcPeers.get(p.from);if(item){try{item.pc.close()}catch(e){};rtcPeers.delete(p.from)}
+      pendingIce.delete(p.from);removeRemoteAudio(p.from);return;
+    }
+    if(p.type==='offer'){
+      const pc=makePeer(p.from,p.name,false);if(!pc||!p.sdp)return;
+      try{
+        await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+        const q=pendingIce.get(p.from)||[];pendingIce.set(p.from,[]);
+        for(const c of q){try{await pc.addIceCandidate(new RTCIceCandidate(c))}catch(e){}}
+        const ans=await pc.createAnswer();await pc.setLocalDescription(ans);sendVoiceSignal('answer',{to:p.from,sdp:pc.localDescription});
+        const item=rtcPeers.get(p.from);if(item)item.remoteSet=true;
+      }catch(e){log('offer handling',e)}
+      return;
+    }
+    if(p.type==='answer'){
+      const item=rtcPeers.get(p.from);if(!item||!p.sdp)return;
+      try{
+        await item.pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+        const q=pendingIce.get(p.from)||[];pendingIce.set(p.from,[]);
+        for(const c of q){try{await item.pc.addIceCandidate(new RTCIceCandidate(c))}catch(e){}}
+        item.remoteSet=true;
+      }catch(e){log('answer handling',e)}
+      return;
+    }
+    if(p.type==='ice'){
+      const item=rtcPeers.get(p.from);if(!item||!p.candidate)return;
+      if(item.pc.remoteDescription&&item.pc.remoteDescription.type){try{await item.pc.addIceCandidate(new RTCIceCandidate(p.candidate))}catch(e){}}
+      else{const q=pendingIce.get(p.from)||[];q.push(p.candidate);pendingIce.set(p.from,q)}
+    }
+  }
+
+  function closeRealtime(){
+    clearReconnect();stopHeartbeat();wsReady=false;
+    try{if(ws&&ws.readyState===1){sendVoiceSignal('leave');sendWs('phx_leave',{},++wsRef)}}catch(e){}
+    try{ws&&ws.close()}catch(e){}
+    ws=null;wsTopic='';
+  }
+  function closePeers(){
+    rtcPeers.forEach((item,id)=>{try{item.pc.close()}catch(e){};removeRemoteAudio(id)});
+    rtcPeers.clear();pendingIce.clear();
+  }
+
+  function connectRealtime(){
+    if(!joiningRoomId||!voiceConnected)return Promise.resolve(false);
+    if(ws&&ws.readyState===1)return Promise.resolve(true);
+    return new Promise((resolve,reject)=>{
+      const topic=roomTopic(joiningRoomId);wsTopic=topic;wsRef=0;wsReady=false;
+      const url=REALTIME_URL+'?apikey='+encodeURIComponent(REALTIME_KEY)+'&vsn=1.0.0';
+      try{ws=new WebSocket(url)}catch(e){scheduleReconnect();reject(e);return}
+      let settled=false;
+      const done=(ok)=>{if(!settled){settled=true;ok?resolve(true):reject(new Error('Realtime indisponível'))}};
+      ws.onopen=()=>{
+        wsReady=false;
+        sendWs('phx_join',{config:{broadcast:{ack:true,self:false},presence:{key:clientId}}},++wsRef);
+        startHeartbeat();
+      };
+      ws.onmessage=ev=>{
+        let m;try{m=JSON.parse(ev.data)}catch(e){return}
+        if(m.event==='phx_reply'&&m.payload&&m.payload.response&&m.payload.response.status==='ok'){if(m.topic===topic){wsReady=true;sendVoiceSignal('join',{roomId:joiningRoomId});done(true)}}
+        else if(m.event==='broadcast'&&m.payload){const p=m.payload.payload||m.payload;handleSignal(p).catch(e=>log('signal',e))}
+        else if(m.event==='phx_error'||m.event==='phx_close'){wsReady=false;done(false);scheduleReconnect()}
+      };
+      ws.onerror=()=>{wsReady=false;done(false)};
+      ws.onclose=()=>{wsReady=false;stopHeartbeat();if(!destroyed&&joiningRoomId&&voiceConnected)scheduleReconnect()};
+      setTimeout(()=>{if(!settled)done(false)},7000);
+    });
+  }
+
+  async function startRealVoice(){
+    if(!current||!voiceConnected)return;
+    if(!window.RTCPeerConnection||!window.WebSocket){if(typeof toast==='function')toast('🌐 Seu navegador não suporta voz em tempo real.');return}
+    joiningRoomId=String(current.id);
+    try{await connectRealtime();toast('🔊 Voz conectada à sala.')}catch(e){log('Realtime',e);toast('⚠️ Microfone ligado, mas a conexão da voz ainda não abriu. Tente novamente.');scheduleReconnect()}
+  }
+  function stopRealVoice(){
+    if(joiningRoomId)sendVoiceSignal('leave');
+    closeRealtime();closePeers();joiningRoomId='';
+  }
+
+  const oldToggle=window.toggleVoiceConnection;
+  window.toggleVoiceConnection=async function(){
+    if(!current)return;
+    if(voiceConnected){stopRealVoice();if(typeof oldToggle==='function')await oldToggle();return}
+    if(typeof oldToggle!=='function'){toast('⚠️ Controle de microfone não encontrado.');return}
+    await oldToggle();
+    if(voiceConnected)await startRealVoice();
   };
+
+  const oldOpen=window.openVoiceRoom;
+  window.openVoiceRoom=async function(id,viaPrivateCode){
+    if(joiningRoomId&&joiningRoomId!==String(id))stopRealVoice();
+    if(typeof oldOpen==='function')return oldOpen(id,viaPrivateCode);
+  };
+  const oldClose=window.closeVoiceRoom;
+  window.closeVoiceRoom=async function(){stopRealVoice();if(typeof oldClose==='function')return oldClose();};
+  window.addEventListener('pagehide',function(){destroyed=true;stopRealVoice()});
+  window.addEventListener('beforeunload',function(){destroyed=true;stopRealVoice()});
+
+  // Reativa a sinalização se o usuário já estiver com o microfone ligado.
+  setTimeout(function(){try{if(typeof voiceConnected!=='undefined'&&voiceConnected&&current)startRealVoice()}catch(e){}},500);
 })();
 </script>
 </body>
