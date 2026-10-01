@@ -7130,6 +7130,46 @@ function action(type){if(type==='play'){window.gnxV11SelectedGame=selected;local
   setTimeout(function(){try{if(typeof voiceConnected!=='undefined'&&voiceConnected&&current)startRealVoice()}catch(e){}},500);
 })();
 </script>
+
+<script id="gamenex-voice-click-hard-fix-v1">
+(function(){
+  'use strict';
+  function runVoiceButton(btn){
+    try{
+      if(!btn || btn.dataset.gnxVoiceBusy==='1') return;
+      btn.dataset.gnxVoiceBusy='1';
+      const oldText=btn.innerHTML;
+      btn.innerHTML='<strong>⏳</strong><span>Conectando...</span>';
+      Promise.resolve().then(function(){
+        if(typeof window.toggleVoiceConnection!=='function') throw new Error('toggleVoiceConnection indisponível');
+        return window.toggleVoiceConnection();
+      }).catch(function(e){
+        console.error('[GameNex voz]',e);
+        try{ if(typeof window.toast==='function') window.toast('⚠️ Não foi possível ativar a voz.'); }catch(_){ }
+        btn.innerHTML=oldText;
+      }).finally(function(){
+        setTimeout(function(){
+          try{
+            btn.dataset.gnxVoiceBusy='0';
+            if(typeof window.renderRoom==='function') window.renderRoom();
+          }catch(_){btn.dataset.gnxVoiceBusy='0'}
+        },250);
+      });
+    }catch(e){
+      btn.dataset.gnxVoiceBusy='0';
+      console.error('[GameNex voz]',e);
+    }
+  }
+  document.addEventListener('click',function(ev){
+    const btn=ev.target&&ev.target.closest ? ev.target.closest('#gnxVoiceRoomOverlay button[aria-label="Entrar no voz"], #gnxVoiceRoomOverlay button[aria-label="Desligar microfone"]') : null;
+    if(!btn) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    if(ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+    runVoiceButton(btn);
+  },true);
+})();
+</script>
 </body>
 <script id="gamenex-v7-search-profile-real-final">
 (function(){
